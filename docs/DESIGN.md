@@ -91,3 +91,39 @@ Campaign/story, sound, accounts, online leaderboard.
 `index.html`, `src/*.js` (ES modules), `src/style.css`. Served as static
 files (GitHub Pages compatible). Content is generated from templates in
 `src/content.js`, so new attacks and legit traffic are data, not code.
+
+
+---
+
+## v2 — what makes it actually fun (post-review pass)
+
+The first cut was a decision drill. This pass makes it a *shift*, in the
+Papers, Please sense: rules pile up, pressure builds, and you juggle.
+
+- **Raw HTTP view.** Requests render as a real request block (request line,
+  `Host`, headers, form body) in monospace, not a tidy key/value table. You
+  read traffic the way you would in a proxy. Only genuinely suspicious or
+  encoded values are highlighted as decode targets, so normal headers
+  (User-Agent, Host, session cookies) stay quiet and don't cry wolf.
+- **Hands-on decoding.** On medium/hard you don't get the answer handed to
+  you. You tap a token and *choose* which transform to apply — URL, Base64,
+  HTML entities, hex, unicode — peeling one layer at a time. A wrong guess
+  does nothing (the button shakes). You decode until it reads as plain text,
+  then judge. Easy keeps auto-decode so newcomers learn the shapes.
+- **Shifts + escalating directives.** Every ~10–15 requests a shift ends
+  (+250) and the boss adds a *new directive* that changes what's allowed:
+  block an IP range, freeze checkout, require auth on `/api/`, honour a
+  red-team header, ban `curl`. Directives stack and are injected into live
+  traffic, so you're constantly re-learning the ruleset mid-run — that's the
+  Papers, Please tension.
+- **Rules that bite both ways.** A rule auto-blocks matching traffic and is
+  evaluated after one URL-decode (like a real WAF), so you can catch encoded
+  attacks — but too broad and it eats real customers, which costs you.
+- **Decoys that look exactly like attacks.** Apostrophes in surnames,
+  URL-encoded ampersands, base64 preference cookies, `<b>` in reviews, PNG
+  avatars. Blocking these is a false positive.
+
+All content (attacks, legit traffic, decoys, directives, patches, decoders)
+lives in `src/content.js` as data. A test hook behind `?test=1` exposes
+ground truth so the playtest harness can drive full runs; it's inert in
+normal play.

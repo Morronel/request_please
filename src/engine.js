@@ -1,39 +1,46 @@
 // Game engine for REQUEST, PLEASE. Pure logic, no DOM.
 import {
   encoders, decodeChain, CLASSES, IPS, COUNTRIES, UAS, SITE,
-  legitPool, attackPool, PATCHES,
+  legitPool, attackPool, PATCHES, DIRECTIVES, DECODERS,
 } from './content.js';
 
 export const DIFFICULTY = {
   easy: {
-    label: 'Easy', timer: 0, encodeDepth: 0, attackShare: 0.4,
+    label: 'Easy', blurb: 'No timer. Light encoding. Auto-decode allowed.',
+    timer: 0, encodeChance: 0.35, encodeDepth: 1, attackShare: 0.45,
     classes: ['sqli', 'xss', 'traversal', 'policy'], decoys: false,
     ruleSlots: 3, fpPenalty: 1, requireClass: false, patchEvery: 8,
+    shiftLen: 15, maxDirectives: 2, autoDecode: true,
   },
   medium: {
-    label: 'Medium', timer: 25, encodeDepth: 2, attackShare: 0.5,
+    label: 'Medium', blurb: '25s per request. Stacked encodings. Decoys.',
+    timer: 25, encodeChance: 0.7, encodeDepth: 2, attackShare: 0.5,
     classes: ['sqli', 'xss', 'traversal', 'cmdi', 'policy'], decoys: true,
     ruleSlots: 2, fpPenalty: 1, requireClass: true, patchEvery: 10,
+    shiftLen: 12, maxDirectives: 4, autoDecode: false,
   },
   hard: {
-    label: 'Hard', timer: 15, timerShrink: 0.985, encodeDepth: 3, attackShare: 0.55,
+    label: 'Hard', blurb: 'Shrinking timer. Deep obfuscation. Every class.',
+    timer: 15, timerShrink: 0.985, encodeChance: 0.9, encodeDepth: 3, attackShare: 0.55,
     classes: ['sqli', 'xss', 'traversal', 'cmdi', 'ssrf', 'policy'], decoys: true,
     ruleSlots: 1, fpPenalty: 2, requireClass: true, patchEvery: 12,
+    shiftLen: 10, maxDirectives: 5, autoDecode: false,
   },
 };
 
 const rand = (n) => Math.floor(Math.random() * n);
 const pick = (a) => a[rand(a.length)];
 
-const LAYER_ENCODERS = ['url', 'base64', 'htmlEntity', 'hex', 'unicode', 'doubleUrl'];
+const LAYER_ENCODERS = ['url', 'base64', 'htmlEntity', 'hex', 'unicode'];
 
-// Wrap a payload string in up to `depth` encoding layers.
+// Wrap a payload in `depth` distinct encoding layers.
 function obfuscate(value, depth) {
   let out = value;
   const used = [];
   for (let i = 0; i < depth; i++) {
-    const enc = pick(LAYER_ENCODERS.filter((e) => !used.includes(e)));
-    if (!enc) break;
+    const options = LAYER_ENCODERS.filter((e) => !used.includes(e));
+    // Base64 only as the outermost layer reads naturally; keep it last.
+    const enc = i < depth - 1 ? pick(options.filter((e) => e !== 'base64')) : pick(options);
     used.push(enc);
     out = encoders[enc].encode(out);
   }
@@ -42,68 +49,89 @@ function obfuscate(value, depth) {
 
 let reqSeq = 0;
 
-export function buildRequest(diff, patchedEndpoints) {
-  const isAttack = Math.random() < diff.attackShare;
-  let base, kind, why, payloadField = null;
-
-  if (isAttack) {
-    const pool = attackPool().filter((a) => diff.classes.includes(a.kind));
-    const tpl = pick(pool);
-    base = tpl.make();
-    kind = tpl.kind;
-    why = tpl.why;
-    payloadField = tpl.payloadField;
-
-    // If this endpoint+class was patched this shift, it's now harmless → legit.
-    if (patchedEndpoints[`${tpl.kind}:${base.path}`]) {
-      kind = 'legit';
-      why = 'This looks like an attack, but you patched this endpoint — the payload is now neutralised, so it is legitimate traffic.';
-    } else if (payloadField && diff.encodeDepth > 0) {
-      // Obfuscate the payload in the field that carries it.
-      const depth = 1 + rand(diff.encodeDepth);
-      const container = base.query && base.query[payloadField] !== undefined ? base.query
-        : base.body && base.body[payloadField] !== undefined ? base.body : null;
-      if (container) container[payloadField] = obfuscate(container[payloadField], depth);
-    }
-  } else {
-    const tpl = pick(legitPool());
-    base = tpl();
-    kind = 'legit';
-    why = base.why;
-    if (base.decoy && !diff.decoys) {
-      // On easy, swap decoys for a plain legit request to keep it fair.
-      return buildRequest(diff, patchedEndpoints);
-    }
+function baseRequest(diff, wantAttack) {
+  if (wantAttack) {
+    const tpl = pick(attackPool().filter((a) => diff.classes.includes(a.kind)));
+    return { base: tpl.make(), kind: tpl.kind, why: tpl.why, payloadField: tpl.payloadField };
   }
+  let base;
+  do { base = pick(legitPool())(); } while (base.decoy && !diff.decoys);
+  return { base, kind: 'legit', why: base.why, payloadField: null };
+}
 
-  return {
+// Build a request. `directive` (optional) is forced to apply to it.
+export function buildRequest(diff, patched, directives, directive) {
+  let wantAttack = Math.random() < diff.attackShare;
+  if (directive) wantAttack = directive.verdict === 'pass'; // pentest wraps an attack
+
+  const { base, kind: baseKind, why: baseWhy, payloadField } = baseRequest(diff, wantAttack);
+  let kind = baseKind;
+  let why = baseWhy;
+
+  const req = {
     seq: ++reqSeq,
     method: base.method,
     path: base.path,
-    query: base.query || {},
-    body: base.body || {},
-    headers: Object.assign(
-      { 'User-Agent': pick(UAS) },
-      base.headers || {}
-    ),
-    ip: pick(IPS),
+    query: { ...(base.query || {}) },
+    body: { ...(base.body || {}) },
+    headers: { 'User-Agent': pick(UAS.filter((u) => !u.startsWith('curl/'))), ...(base.headers || {}) },
+    ip: pick(IPS.filter((ip) => !ip.startsWith('198.51.100.'))),
     country: pick(COUNTRIES),
-    kind,          // 'legit' or an attack class id
-    why,
-    isAttack: kind !== 'legit',
     decoy: !!base.decoy,
+    encodedLayers: 0,
   };
+  if (directive) directive.inject(req);
+
+  if (kind !== 'legit') {
+    if (patched[`${kind}:${req.path}`]) {
+      kind = 'legit';
+      why = 'Looks hostile, but you patched this endpoint. The payload is harmless now, so it is legit traffic.';
+    } else if (payloadField && Math.random() < diff.encodeChance) {
+      const box = req.query[payloadField] !== undefined ? req.query
+        : req.body[payloadField] !== undefined ? req.body : null;
+      if (box) {
+        const depth = 1 + rand(diff.encodeDepth);
+        box[payloadField] = obfuscate(box[payloadField], depth);
+        req.encodedLayers = depth;
+      }
+    }
+  }
+
+  // Directives override the base verdict. A 'pass' directive wins outright.
+  const accept = kind === 'legit' ? [] : [kind];
+  const passDir = directives.find((d) => d.verdict === 'pass' && d.applies(req));
+  const blockDir = directives.find((d) => d.verdict === 'block' && d.applies(req));
+  if (passDir) {
+    kind = 'legit';
+    why = `Directive: ${passDir.text}`;
+    accept.length = 0;
+  } else if (blockDir) {
+    if (kind === 'legit') { kind = 'policy'; why = `Directive: ${blockDir.text}`; }
+    if (!accept.includes('policy')) accept.push('policy');
+    if (!accept.includes(kind)) accept.push(kind);
+  }
+  req.directive = passDir || blockDir || null;
+
+  req.kind = kind;
+  req.why = why;
+  req.isAttack = kind !== 'legit';
+  req.accept = accept;
+  return req;
 }
 
-// A rule: field (path|ip|contains), op, value. Returns 'block' if it matches.
+// A rule matches a request: field is path | ip | contains.
 export function ruleMatches(rule, req) {
-  const hay = JSON.stringify({ path: req.path, query: req.query, body: req.body,
-    headers: req.headers, ip: req.ip }).toLowerCase();
   const v = rule.value.toLowerCase();
   switch (rule.field) {
-    case 'path': return req.path.toLowerCase() === v || req.path.toLowerCase().startsWith(v);
-    case 'ip': return req.ip === rule.value;
-    case 'contains': return hay.includes(v);
+    case 'path': return req.path.toLowerCase().startsWith(v);
+    case 'ip': return req.ip.startsWith(rule.value);
+    case 'contains': {
+      // Rules see the request after one round of URL decoding, like a real WAF.
+      const hay = JSON.stringify({ path: req.path, query: req.query, body: req.body, headers: req.headers });
+      let dec = hay;
+      try { dec = decodeURIComponent(hay); } catch (e) { /* keep raw */ }
+      return hay.toLowerCase().includes(v) || dec.toLowerCase().includes(v);
+    }
     default: return false;
   }
 }
@@ -117,13 +145,17 @@ export class Game {
     this.maxMeter = 3;
     this.score = 0;
     this.combo = 0;
+    this.bestCombo = 0;
     this.correct = 0;
     this.total = 0;
     this.sinceRefill = 0;
     this.sincePatch = 0;
+    this.shift = 1;
+    this.inShift = 0;
+    this.directives = [];
     this.rules = [];
-    this.patched = {};               // 'cls:/path' -> true
-    this.stats = {};                 // per-class {seen, right}
+    this.patched = {};
+    this.stats = {};
     this.timerBudget = this.diff.timer;
     this.over = false;
     CLASSES.forEach((c) => (this.stats[c.id] = { seen: 0, right: 0 }));
@@ -132,114 +164,130 @@ export class Game {
   }
 
   get ruleSlotsLeft() { return this.diff.ruleSlots - this.rules.length; }
+  comboMult() { return Math.min(4, 1 + Math.floor(this.combo / 3)); }
 
   next() {
-    this.current = buildRequest(this.diff, this.patched);
-    // Auto-apply rules.
-    const autoBlocked = this.rules.find((r) => ruleMatches(r, this.current));
-    this.current.autoBlocked = autoBlocked || null;
+    // About a third of requests exercise an active directive, so rules matter.
+    const forced = this.directives.length && Math.random() < 0.33 ? pick(this.directives) : null;
+    this.current = buildRequest(this.diff, this.patched, this.directives, forced);
+    this.current.rule = this.rules.find((r) => ruleMatches(r, this.current)) || null;
     return this.current;
   }
 
-  // Decode a token string fully; UI uses this for the decoder sheet.
-  decode(str) { return decodeChain(str); }
+  decodeAll(str) { return decodeChain(str); }
 
-  comboMult() { return Math.min(4, 1 + Math.floor(this.combo / 3)); }
-
-  // decision: 'pass' | 'block'; chosenClass only for block.
-  // timeTakenRatio: 0..1 of the timer used (for speed bonus); 1 if no timer.
-  resolve(decision, chosenClass, timeTakenRatio = 1) {
+  // decision: 'pass' | 'block'. chosenClass for manual blocks.
+  // opts.auto: resolved by a player rule. opts.timeRatio: 0..1 of timer used.
+  resolve(decision, chosenClass, opts = {}) {
     const req = this.current;
+    const auto = !!opts.auto;
     this.total++;
+    this.inShift++;
     const statKey = req.isAttack ? req.kind : 'legit';
     this.stats[statKey].seen++;
 
     let correct = false;
-    let delta = 0;
-    let message = '';
+    let base = 0;
     let classRight = null;
+    let message;
 
-    if (req.isAttack) {
-      if (decision === 'block') {
-        correct = true;
-        classRight = chosenClass === req.kind;
-        delta = 150 + (classRight ? 50 : 0);
-        message = classRight
-          ? `Correct block. ${req.why}`
-          : (this.diff.requireClass
-              ? `Blocked, but wrong class (it was ${classLabel(req.kind)}). Half credit. ${req.why}`
-              : `Blocked. It was ${classLabel(req.kind)}. ${req.why}`);
-        if (this.diff.requireClass && !classRight) delta = Math.floor(delta / 2);
+    if (req.isAttack && decision === 'block') {
+      correct = true;
+      if (auto) {
+        base = 100;
+        message = `Your rule caught it. ${req.why}`;
       } else {
-        correct = false;
-        delta = 0;
-        message = `Breach! You passed an attack. ${req.why}`;
-        this.integrity--;
+        classRight = req.accept.includes(chosenClass);
+        base = 150 + (classRight ? 50 : 0);
+        if (classRight || chosenClass == null) message = `Clean block. ${req.why}`;
+        else message = `Blocked, but it was ${classLabel(req.kind)}${this.diff.requireClass ? '. Half credit' : ''}. ${req.why}`;
+        if (this.diff.requireClass && !classRight) base = Math.floor(base / 2);
       }
+    } else if (req.isAttack) {
+      message = `BREACH. You let an attack through. ${req.why}`;
+      this.integrity--;
+    } else if (decision === 'pass') {
+      correct = true;
+      base = 100;
+      message = `Good pass. ${req.why}`;
     } else {
-      if (decision === 'pass') {
-        correct = true;
-        delta = 100;
-        message = `Correct pass. ${req.why}`;
-      } else {
-        correct = false;
-        delta = 0;
-        message = `False positive — that was legitimate. ${req.why}`;
-        this.reputation -= this.diff.fpPenalty;
-      }
+      message = auto
+        ? `Your rule blocked a real customer. ${req.why}`
+        : `False positive. That was a real customer. ${req.why}`;
+      this.reputation -= this.diff.fpPenalty;
     }
 
+    let delta = 0;
     if (correct) {
       this.combo++;
+      this.bestCombo = Math.max(this.bestCombo, this.combo);
       this.correct++;
       this.stats[statKey].right++;
-      const mult = this.comboMult();
-      const speed = this.diff.timer ? Math.round(30 * (1 - timeTakenRatio)) : 0;
-      delta = delta * mult + speed;
-      this.sinceRefill++;
-      if (this.sinceRefill >= 10) {
+      const speed = this.diff.timer && !auto ? Math.round(40 * (1 - (opts.timeRatio ?? 1))) : 0;
+      delta = base * this.comboMult() + speed;
+      if (++this.sinceRefill >= 10) {
         this.sinceRefill = 0;
-        if (this.integrity < this.maxMeter) this.integrity++;
-        else if (this.reputation < this.maxMeter) this.reputation++;
-        message += ' (+1 meter refilled)';
+        if (this.integrity < this.maxMeter) { this.integrity++; message += ' +1 ♥ restored.'; }
+        else if (this.reputation < this.maxMeter) { this.reputation++; message += ' +1 ★ restored.'; }
       }
     } else {
       this.combo = 0;
     }
-
     this.score += delta;
+    return this.afterDecision({ correct, delta, message, classRight, auto });
+  }
+
+  // The player ran out of time: the request is dropped.
+  timeout() {
+    const req = this.current;
+    this.total++;
+    this.inShift++;
+    this.stats[req.isAttack ? req.kind : 'legit'].seen++;
+    this.combo = 0;
+    this.reputation--;
+    return this.afterDecision({
+      correct: false, delta: 0, timeout: true,
+      message: `Timed out. The request was dropped and a customer gave up. ${req.why}`,
+    });
+  }
+
+  afterDecision(res) {
     if (this.integrity <= 0 || this.reputation <= 0) this.over = true;
+    if (this.diff.timerShrink) this.timerBudget = Math.max(7, this.timerBudget * this.diff.timerShrink);
 
-    // Shrinking timer on hard.
-    if (this.diff.timerShrink) this.timerBudget = Math.max(6, this.timerBudget * this.diff.timerShrink);
-
-    // Should a patch event trigger?
-    this.sincePatch++;
     let patchEvent = null;
-    if (!this.over && this.sincePatch >= this.diff.patchEvery) {
-      this.sincePatch = 0;
-      const avail = PATCHES.filter(
-        (p) => this.diff.classes.includes(p.cls) && !this.patched[`${p.cls}:${p.endpoint}`]
-      );
-      if (avail.length) patchEvent = pick(avail);
+    let shiftEvent = null;
+    if (!this.over) {
+      if (++this.sincePatch >= this.diff.patchEvery) {
+        const avail = PATCHES.filter((p) => this.diff.classes.includes(p.cls) && !this.patched[`${p.cls}:${p.endpoint}`]);
+        if (avail.length) { patchEvent = pick(avail); this.sincePatch = 0; }
+      }
+      if (!patchEvent && this.inShift >= this.diff.shiftLen) shiftEvent = this.startShift();
     }
-
     return {
-      correct, delta, message, classRight,
-      integrity: this.integrity, reputation: this.reputation,
+      ...res, integrity: this.integrity, reputation: this.reputation,
       score: this.score, combo: this.combo, mult: this.comboMult(),
-      over: this.over, patchEvent, wasAttack: req.isAttack, actualClass: req.kind,
+      over: this.over, patchEvent, shiftEvent,
+      wasAttack: this.current.isAttack, actualClass: this.current.kind,
     };
   }
 
-  applyPatch(patch, choiceIndex) {
-    const ok = patch.options[choiceIndex] && patch.options[choiceIndex].ok;
-    if (ok) {
-      this.patched[`${patch.cls}:${patch.endpoint}`] = true;
-      this.score += 200;
-    } else {
-      this.score = Math.max(0, this.score - 50);
+  startShift() {
+    this.shift++;
+    this.inShift = 0;
+    let added = null;
+    if (this.directives.length < this.diff.maxDirectives) {
+      const unused = DIRECTIVES.filter((d) => !this.directives.includes(d));
+      if (unused.length) { added = pick(unused); this.directives.push(added); }
     }
+    this.score += 250; // survived a shift
+    return { shift: this.shift, added, bonus: 250 };
+  }
+
+  applyPatch(patch, choiceIndex) {
+    const ok = !!(patch.options[choiceIndex] && patch.options[choiceIndex].ok);
+    if (ok) { this.patched[`${patch.cls}:${patch.endpoint}`] = true; this.score += 200; }
+    else this.score = Math.max(0, this.score - 50);
     return { ok, explain: patch.explain, bonus: ok ? 200 : -50 };
   }
 
@@ -249,19 +297,19 @@ export class Game {
     return true;
   }
 
+  removeRule(i) { this.rules.splice(i, 1); }
+
   report() {
     const perClass = Object.entries(this.stats)
       .filter(([, s]) => s.seen > 0)
       .map(([k, s]) => ({
-        key: k,
-        label: k === 'legit' ? 'Legit traffic' : classLabel(k),
-        seen: s.seen, right: s.right,
-        pct: Math.round((s.right / s.seen) * 100),
+        key: k, label: k === 'legit' ? 'Legit traffic' : classLabel(k),
+        seen: s.seen, right: s.right, pct: Math.round((s.right / s.seen) * 100),
       }));
     return {
       score: this.score, total: this.total, correct: this.correct,
       accuracy: this.total ? Math.round((this.correct / this.total) * 100) : 0,
-      perClass, difficulty: this.diff.label,
+      perClass, difficulty: this.diff.label, shift: this.shift, bestCombo: this.bestCombo,
     };
   }
 }
@@ -271,4 +319,4 @@ export function classLabel(id) {
   return c ? c.label : id;
 }
 
-export { CLASSES, SITE };
+export { CLASSES, SITE, DECODERS };

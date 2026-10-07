@@ -129,10 +129,11 @@ export const SITE = {
   tagline: 'the internet pet superstore',
   endpoints: ['/', '/search', '/product', '/cart', '/checkout', '/login',
               '/account', '/api/orders', '/api/user', '/admin', '/avatar', '/fetch'],
-  directives: [
-    'The /admin panel is internal only — public requests to it are a policy violation.',
-    'Partner bot MeowMart-App is trusted. Normal shoppers use browsers.',
-    'Avatars are uploaded as base64 — decode them, but images are fine.',
+  // Standing orders that hold on every shift.
+  standing: [
+    'The /admin panel is internal only. Public requests to it are Policy.',
+    'Dumping every user (id=*) is Policy, even without a payload.',
+    'Avatars arrive as base64 images. Decode before you judge.',
   ],
 };
 
@@ -151,10 +152,14 @@ const legit = [
   () => ({ method: 'POST', path: '/login', body: { user: pick(['sophie', 'liam', 'noah', 'mia']), pass: '••••••••' }, why: 'Plain login, no injection.' }),
   () => ({ method: 'GET', path: '/account', headers: { Cookie: 'session=a3f9c2e1b7d4' }, why: 'Logged-in shopper viewing their account.' }),
   () => ({ method: 'GET', path: '/api/orders', headers: { Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJ1aWQiOjQyfQ.sig' }, why: 'Valid-looking API token, normal endpoint.' }),
-  // decoy: contains scary-looking but harmless content
-  () => ({ method: 'POST', path: '/search', body: { q: "How do I use ' OR 1=1 safely in a tutorial?" }, why: 'A forum search that just MENTIONS SQL — no actual injection against our query.', decoy: true }),
-  () => ({ method: 'POST', path: '/product', body: { review: 'I love the <b>blue</b> collar!' }, why: 'A review using a harmless bold tag, not a script.', decoy: true }),
-  () => ({ method: 'POST', path: '/avatar', body: { img: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==' }, why: 'Base64 avatar upload — decodes to an image header, not code.', decoy: true }),
+  // Decoys: legit traffic that LOOKS suspicious. Medium/hard only.
+  () => ({ method: 'POST', path: '/checkout', body: { name: "Siobhan O'Brien", city: 'Dublin' }, why: "An apostrophe in a surname is not SQL injection. Block O'Brien and you lose a customer.", decoy: true }),
+  () => ({ method: 'GET', path: '/search', query: { q: encodeURIComponent('rock & roll cat toy') }, why: 'URL-encoded ampersand and spaces. Encoding alone is not an attack.', decoy: true }),
+  () => ({ method: 'POST', path: '/account', body: { name: encodeURIComponent('Zoë Müller') }, why: 'Percent-encoded UTF-8 letters in a name. Perfectly normal.', decoy: true }),
+  () => ({ method: 'GET', path: '/cart', headers: { Cookie: 'prefs=' + btoa('{"theme":"dark","lang":"en"}') }, why: 'A base64 cookie that decodes to harmless JSON preferences.', decoy: true }),
+  () => ({ method: 'POST', path: '/product', body: { review: 'I love the <b>blue</b> collar!' }, why: 'A review using a harmless bold tag. Our renderer allows <b>.', decoy: true }),
+  () => ({ method: 'POST', path: '/avatar', body: { img: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB' }, why: 'Base64 avatar upload. It decodes to a PNG header, which is image data, not code.', decoy: true }),
+  () => ({ method: 'GET', path: '/product', query: { id: '412', ref: 'newsletter-2026-10' }, why: 'Campaign tracking parameter. Dashes are fine.', decoy: true }),
 ];
 
 // Attacks ------------------------------------------------------------------
@@ -245,5 +250,82 @@ export const PATCHES = [
       { code: 'u = u.replace("localhost","")', ok: false },
     ],
     explain: 'An allow-list of hostnames beats trying to blacklist every internal address.',
+  },
+];
+
+// ---- manual decoders (the player picks which one to apply) ---------------
+// Each returns the decoded string, or null if the input isn't valid for it.
+
+function isPrintable(s) { return !/[\x00-\x08\x0e-\x1f]/.test(s); }
+
+export const DECODERS = [
+  { id: 'url', label: 'URL', apply(s) {
+      if (!/%[0-9a-fA-F]{2}/.test(s)) return null;
+      try { const d = decodeURIComponent(s.replace(/\+/g, ' ')); return d !== s ? d : null; } catch (e) { return null; }
+    } },
+  { id: 'b64', label: 'Base64', apply(s) {
+      const t = s.trim();
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(t) || t.length < 4 || t.length % 4 !== 0) return null;
+      let bin;
+      try { bin = atob(t); } catch (e) { return null; }
+      if (bin.startsWith('\x89PNG')) return '[PNG image header: binary picture data]';
+      try { const d = decodeURIComponent(escape(bin)); return isPrintable(d) ? d : null; } catch (e) { return null; }
+    } },
+  { id: 'html', label: 'HTML &#;', apply(s) {
+      if (!/&#x?[0-9a-fA-F]+;/.test(s)) return null;
+      return s.replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+              .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
+    } },
+  { id: 'hex', label: 'Hex \\x', apply(s) {
+      if (!/\\x[0-9a-fA-F]{2}/.test(s)) return null;
+      return s.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    } },
+  { id: 'uni', label: 'Unicode \\u', apply(s) {
+      if (!/\\u[0-9a-fA-F]{4}/.test(s)) return null;
+      return s.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+    } },
+];
+
+// ---- shift directives ----------------------------------------------------
+// Papers Please-style rule escalation: every shift adds one directive.
+// `applies(req)` says whether the directive governs this request, and
+// `verdict` is what the directive demands: 'block' (policy) or 'pass'.
+// `inject(req)` nudges a fresh request so directive cases actually show up.
+
+export const DIRECTIVES = [
+  {
+    id: 'abuse-range',
+    text: 'Abuse reports from 198.51.100.0/24. BLOCK everything from that range as Policy.',
+    applies: (r) => r.ip.startsWith('198.51.100.'),
+    verdict: 'block',
+    inject: (r) => { r.ip = '198.51.100.' + (2 + Math.floor(Math.random() * 250)); },
+  },
+  {
+    id: 'checkout-freeze',
+    text: 'Payments are under maintenance. BLOCK any POST to /checkout as Policy.',
+    applies: (r) => r.method === 'POST' && r.path === '/checkout',
+    verdict: 'block',
+    inject: (r) => { r.method = 'POST'; r.path = '/checkout'; r.query = {}; r.body = { sku: 'CAT-1207', qty: '1' }; },
+  },
+  {
+    id: 'api-auth',
+    text: 'Every /api/ request needs an Authorization header. BLOCK ones without it as Policy.',
+    applies: (r) => r.path.startsWith('/api/') && !r.headers.Authorization,
+    verdict: 'block',
+    inject: (r) => { r.method = 'GET'; r.path = '/api/orders'; r.query = { page: '2' }; r.body = {}; delete r.headers.Authorization; },
+  },
+  {
+    id: 'pentest',
+    text: 'Red team exercise today. Requests with header X-Pentest: meow-ok are authorized. PASS them, even if hostile.',
+    applies: (r) => r.headers['X-Pentest'] === 'meow-ok',
+    verdict: 'pass',
+    inject: (r) => { r.headers['X-Pentest'] = 'meow-ok'; },
+  },
+  {
+    id: 'curl-ban',
+    text: 'Scrapers are hammering us. BLOCK any User-Agent starting with curl/ as Policy.',
+    applies: (r) => /^curl\//.test(r.headers['User-Agent'] || ''),
+    verdict: 'block',
+    inject: (r) => { r.headers['User-Agent'] = 'curl/8.4.0'; },
   },
 ];
